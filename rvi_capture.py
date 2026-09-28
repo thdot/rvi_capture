@@ -306,17 +306,24 @@ class NGPacketDumper(PacketDumper):
             if if_idx == next_if_idx:
                 # write interface block
                 self._write_block(1, self.INTERFACE_BLOCK_STRUCT.pack(
-                    1 if pkt.is_eth else 101, 0, 0xFFFFFFFF),
+                    self._link_type(pkt), 0, 0xFFFFFFFF),
                     {2: if_name.encode()}) # if_name
                 next_if_idx += 1
             # write packet block
-            payload_len = len(pkt.pkt_payload)
+            payload = self._payload(pkt)
+            payload_len = len(payload)
             pcap_hdr = self.ENHANCED_PACKET_STRUCT.pack(
                 if_idx,
                 pkt.epoch_usecs >> 32, pkt.epoch_usecs & 0xFFFFFFFF,
                 payload_len, payload_len)
-            self._write_block(6, pcap_hdr + pkt.pkt_payload,
+            self._write_block(6, pcap_hdr + payload,
                               {2: UM32.pack(self.IN_OUT_TO_EPBFLAGS[pkt.in_out])})
+
+    def _link_type(self, pkt):
+        return 1 if pkt.is_eth else 101   # Ethernet / raw IP
+
+    def _payload(self, pkt):
+        return pkt.pkt_payload
 
     def _write_block(self, blk_type, blk_data, blk_options={}):
         blks = [UM32.pack(blk_type), b'']
@@ -330,6 +337,33 @@ class NGPacketDumper(PacketDumper):
         blks[1] = total_len_b
         blks += (total_len_b,)
         self.out_file.write(b''.join(blks))
+
+
+class PKTAPPacketDumper(NGPacketDumper):
+    # pcapng with a PKTAP header in front of every packet, which carries the
+    # process info; Wireshark shows it as pktap.cmdname, pktap.pid etc.
+    # struct pktap_header from xnu bsd/net/pktap.h (little endian)
+    PKTAP_HEADER_STRUCT = struct.Struct('<III24sIIIIi20sIHHi20s')
+    IN_OUT_TO_PTHFLAGS = {'I': 0x1, 'O': 0x2, 'U': 0x0}
+
+    def _link_type(self, pkt):
+        return 258  # PKTAP
+
+    def _payload(self, pkt):
+        (comm, pid), (ecomm, epid) = pkt.proc, pkt.eproc
+        header = self.PKTAP_HEADER_STRUCT.pack(
+            self.PKTAP_HEADER_STRUCT.size,
+            1,  # PTH_TYPE_PACKET
+            super()._link_type(pkt),
+            pkt.iface_name.encode(),
+            self.IN_OUT_TO_PTHFLAGS[pkt.in_out],
+            pkt.proto_family,
+            0, 0,   # frame pre/post length
+            pid, comm.encode(),
+            pkt.svc_class,
+            0, 0,   # iftype, ifunit (unit is already part of the name)
+            epid, ecomm.encode())
+        return header + pkt.pkt_payload
 
 
 class PCAPPacketDumper(PacketDumper):
@@ -374,6 +408,13 @@ def extcap_dlts(iface):
     # this is only what Wireshark shows in its interface list
     print('dlt {number=1}{name=EN10MB}{display=Ethernet / raw IP}')
 
+def extcap_config(iface):
+    print('arg {number=0}{call=--format}{display=Capture format}'
+          '{tooltip=PKTAP adds the sending/receiving process to every packet (pktap.cmdname, pktap.pid)}'
+          '{type=selector}')
+    print('value {arg=0}{value=pktap}{display=pcapng with process info (PKTAP)}{default=true}')
+    print('value {arg=0}{value=pcapng}{display=pcapng}{default=false}')
+
 def extcap_udid(iface):
     if not (iface and iface.startswith(EXTCAP_IFACE_PREFIX)):
         raise SystemExit('unknown extcap interface: {}'.format(iface))
@@ -392,8 +433,8 @@ def main():
     parser = argparse.ArgumentParser(description='Captures packets from iOS devices.',
                                      formatter_class=HelpFormatter)
     parser.add_argument('--format',
-                        choices=('pcap', 'pcapng'), default='pcapng',
-                        help='capture format')
+                        choices=('pcap', 'pcapng', 'pktap'), default=argparse.SUPPRESS,
+                        help='capture format (default: pcapng, or pktap when run by Wireshark)')
     parser.add_argument('--udid', help='device UDID (if more than 1 device)')
     parser.add_argument('outfile', nargs='?', help='output file (- for stdout)')
     extcap = parser.add_argument_group('Wireshark extcap options (used by Wireshark itself)')
@@ -412,16 +453,20 @@ def main():
     if args.extcap_dlts:
         return extcap_dlts(args.extcap_interface)
     if args.extcap_config:
-        return  # no config options
+        return extcap_config(args.extcap_interface)
     extcap_mode = args.capture
     if extcap_mode:
         if not args.fifo:
             parser.error('--capture requires --fifo')
         args.udid = extcap_udid(args.extcap_interface)
         args.outfile = args.fifo
-        args.format = 'pcapng'
+        args.format = getattr(args, 'format', 'pktap')
+        if args.format == 'pcap':
+            args.format = 'pcapng'  # Wireshark needs per-interface info
     elif args.outfile is None:
         parser.error('the following arguments are required: outfile')
+    else:
+        args.format = getattr(args, 'format', 'pcapng')
     # open output file
     if args.outfile == '-':
         out_file = sys.stdout.buffer
@@ -433,6 +478,7 @@ def main():
     dumper_class = {
         'pcap':   PCAPPacketDumper,
         'pcapng': NGPacketDumper,
+        'pktap':  PKTAPPacketDumper,
     }[args.format]
     # start capture
     num_packets = 0

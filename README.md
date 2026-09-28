@@ -17,12 +17,14 @@ Tested on Arch Linux with iOS 14.8.
 ## Usage
 
 ```
-./rvi_capture.py [--format {pcap,pcapng}] [--udid UDID] outfile
+./rvi_capture.py [--format {pcap,pcapng,pktap}] [--udid UDID] outfile
 ```
 * `--format`: capture format
     * pcapng: The default. Newer and allows for distinguishing between interfaces.
       Wireshark 3.0+ supports streaming captures with this format.
     * pcap: Older format for compatibility.
+    * pktap: pcapng with the sending/receiving process of each packet
+      (Wireshark fields `pktap.cmdname`, `pktap.pid`). Default when run by Wireshark.
 * `--udid`: device UDID  
   The specific device to target. If omitted, the first device found will be used.
 * `outfile`: output file or FIFO, or `-` for standard output.
