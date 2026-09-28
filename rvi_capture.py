@@ -95,6 +95,34 @@ class LIDContainer(object):
     def _init_handle(self, *args, **kwargs):
         raise NotImplementedError
 
+def list_devices():
+    devices_p = ctypes.POINTER(ctypes.c_char_p)()
+    count = ctypes.c_int(0)
+    err = cdll.idevice_get_device_list(ctypes.byref(devices_p), ctypes.byref(count))
+    if err == -3:
+        return []   # no devices connected
+    IDeviceError.check(err)
+    udids = [devices_p[i].decode() for i in range(count.value)]
+    cdll.idevice_device_list_free(devices_p)
+    return list(dict.fromkeys(udids))   # a device may be listed once per connection type
+
+def get_device_name(udid):
+    # plain lockdown connection without handshake; works even before the device is paired
+    try:
+        idevice = IDevice(udid=udid)
+    except IDeviceError:
+        return None
+    client = ctypes.c_void_p(0)
+    if cdll.lockdownd_client_new(idevice.handle, ctypes.byref(client), b'rvi_capture') != 0:
+        return None
+    try:
+        name = ctypes.c_char_p()
+        if cdll.lockdownd_get_device_name(client, ctypes.byref(name)) != 0 or not name.value:
+            return None
+        return name.value.decode('utf-8', 'replace')  # the tiny malloc'ed string is leaked
+    finally:
+        cdll.lockdownd_client_free(client)
+
 class IDevice(LIDContainer):
     destructor = cdll.idevice_free
     error_class = IDeviceError
@@ -330,6 +358,28 @@ class PCAPPacketDumper(PacketDumper):
 
 stderr_print = functools.partial(print, file=sys.stderr)
 
+
+# Wireshark extcap interface, see https://www.wireshark.org/docs/wsdg_html_chunked/ChCaptureExtcap.html
+EXTCAP_IFACE_PREFIX = 'rvi-'
+
+def extcap_interfaces():
+    print('extcap {version=1.0}{help=https://github.com/thdot/rvi_capture}')
+    for udid in list_devices():
+        name = get_device_name(udid)
+        display = 'iOS device: {} ({})'.format(name, udid) if name else 'iOS device: {}'.format(udid)
+        print('interface {{value={}{}}}{{display={}}}'.format(EXTCAP_IFACE_PREFIX, udid, display))
+
+def extcap_dlts(iface):
+    # the pcapng stream carries per-interface link types (Ethernet or raw IP);
+    # this is only what Wireshark shows in its interface list
+    print('dlt {number=1}{name=EN10MB}{display=Ethernet / raw IP}')
+
+def extcap_udid(iface):
+    if not (iface and iface.startswith(EXTCAP_IFACE_PREFIX)):
+        raise SystemExit('unknown extcap interface: {}'.format(iface))
+    return iface[len(EXTCAP_IFACE_PREFIX):]
+
+
 def main():
     # turn off buffered output
     if isinstance(sys.stdout.buffer, io.BufferedWriter):
@@ -345,8 +395,33 @@ def main():
                         choices=('pcap', 'pcapng'), default='pcapng',
                         help='capture format')
     parser.add_argument('--udid', help='device UDID (if more than 1 device)')
-    parser.add_argument('outfile', help='output file (- for stdout)')
+    parser.add_argument('outfile', nargs='?', help='output file (- for stdout)')
+    extcap = parser.add_argument_group('Wireshark extcap options (used by Wireshark itself)')
+    extcap.add_argument('--extcap-interfaces', action='store_true', help='list interfaces')
+    extcap.add_argument('--extcap-version', help='Wireshark version')
+    extcap.add_argument('--extcap-interface', help='interface to operate on')
+    extcap.add_argument('--extcap-dlts', action='store_true', help='list link types')
+    extcap.add_argument('--extcap-config', action='store_true', help='list config options')
+    extcap.add_argument('--extcap-capture-filter', help='capture filter (ignored)')
+    extcap.add_argument('--capture', action='store_true', help='start capture')
+    extcap.add_argument('--fifo', help='FIFO to write the capture to')
     args = parser.parse_args()
+    # handle extcap queries
+    if args.extcap_interfaces:
+        return extcap_interfaces()
+    if args.extcap_dlts:
+        return extcap_dlts(args.extcap_interface)
+    if args.extcap_config:
+        return  # no config options
+    extcap_mode = args.capture
+    if extcap_mode:
+        if not args.fifo:
+            parser.error('--capture requires --fifo')
+        args.udid = extcap_udid(args.extcap_interface)
+        args.outfile = args.fifo
+        args.format = 'pcapng'
+    elif args.outfile is None:
+        parser.error('the following arguments are required: outfile')
     # open output file
     if args.outfile == '-':
         out_file = sys.stdout.buffer
@@ -360,12 +435,16 @@ def main():
         'pcapng': NGPacketDumper,
     }[args.format]
     # start capture
-    stderr_print('capturing to {} ...'.format('<stdout>' if args.outfile == '-' else args.outfile))
     num_packets = 0
     def packet_callback(pkt):
         nonlocal num_packets
         num_packets += 1
         stderr_print('\r{} packets captured.'.format(num_packets), end='', flush=True)
+    if extcap_mode:
+        # Wireshark treats stderr output as an error, so stay quiet
+        packet_callback = None
+    else:
+        stderr_print('capturing to {} ...'.format('<stdout>' if args.outfile == '-' else args.outfile))
     try:
         packet_extractor = PacketExtractor(udid=args.udid)
         packet_dumper = dumper_class(packet_extractor, out_file)
@@ -374,8 +453,13 @@ def main():
         stderr_print()
         stderr_print('closing capture ...')
         out_file.close()
+    except BrokenPipeError:
+        # reader (e.g. Wireshark) went away
+        if not extcap_mode:
+            stderr_print()
+            stderr_print('output closed, stopping capture.')
     except:
-        stderr_print()
+        extcap_mode or stderr_print()
         raise
 
 if __name__ == '__main__':

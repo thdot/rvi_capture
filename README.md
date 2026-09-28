@@ -32,6 +32,12 @@ Tested on Arch Linux with iOS 14.8.
 ./rvi_capture.py - | wireshark -k -i -
 ```
 
+To capture directly from Wireshark's interface list, link the script into Wireshark's extcap
+folder (see `tshark -G folders`), e.g.:
+```
+sudo ln -s "$PWD/rvi_capture.py" /usr/local/lib/wireshark/extcap/
+```
+
 ### Tips
 - In Wireshark, you can filter for a particular network interface based on the
   `frame.interface_name` field. Here are some possible values (as tested on iOS 14.8):
